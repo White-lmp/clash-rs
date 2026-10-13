@@ -188,12 +188,78 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
     })
 }
 
+/// A handle to a running instance's [`RuntimeComponents`].
+///
+/// `RuntimeComponents` is built on the runtime thread inside [`start`], so an
+/// embedding application otherwise has no way to reach it — the only accessor
+/// is the `ApiRunner` also created there. This slot closes that gap without a
+/// global: the caller creates one, hands it to
+/// [`start_scaffold_instance_with_handle`], and reads the components once the
+/// instance is up. It stays empty until then, and is emptied again when the
+/// instance stops.
+#[derive(Clone, Default)]
+pub struct RuntimeHandle(
+    Arc<RwLock<Option<Arc<RwLock<Arc<RuntimeComponents>>>>>>,
+);
+
+impl RuntimeHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The running instance's components, or `None` while the instance is
+    /// still initializing (or after it has stopped).
+    pub fn components(&self) -> Option<Arc<RuntimeComponents>> {
+        self.0
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|shared| shared.read().unwrap().clone())
+    }
+
+    /// Publish the instance's components to this handle.
+    pub fn set(&self, components: Arc<RwLock<Arc<RuntimeComponents>>>) {
+        *self.0.write().unwrap() = Some(components);
+    }
+
+    /// Forget the components (the instance is gone).
+    pub fn clear(&self) {
+        *self.0.write().unwrap() = None;
+    }
+}
+
 /// Start a Clash instance in a background thread with independent lifecycle.
 /// Returns the thread handle and a CancellationToken to shut it down.
 /// Unlike `start_scaffold`, this does NOT register in the global
 /// SHUTDOWN_TOKEN.
 pub fn start_scaffold_instance(
     opts: Options,
+) -> Result<(
+    std::thread::JoinHandle<()>,
+    tokio_util::sync::CancellationToken,
+)> {
+    spawn_instance(opts, None)
+}
+
+/// Same as [`start_scaffold_instance`], but also fills `runtime_handle` with
+/// the instance's runtime components as soon as they exist.
+///
+/// Embedders that must not open a socket to observe the instance (a Flutter↔Rust
+/// FFI bridge, for example — the HTTP controller would be the only alternative)
+/// use this instead of reaching for the IPC/REST API.
+pub fn start_scaffold_instance_with_handle(
+    opts: Options,
+    runtime_handle: RuntimeHandle,
+) -> Result<(
+    std::thread::JoinHandle<()>,
+    tokio_util::sync::CancellationToken,
+)> {
+    spawn_instance(opts, Some(runtime_handle))
+}
+
+fn spawn_instance(
+    opts: Options,
+    runtime_handle: Option<RuntimeHandle>,
 ) -> Result<(
     std::thread::JoinHandle<()>,
     tokio_util::sync::CancellationToken,
@@ -212,6 +278,7 @@ pub fn start_scaffold_instance(
     let token = tokio_util::sync::CancellationToken::new();
     let token_clone = token.clone();
 
+    let handle_for_thread = runtime_handle.clone();
     let handle = std::thread::spawn(move || {
         let rt = match rt_kind {
             TokioRuntime::MultiThread => tokio::runtime::Builder::new_multi_thread(),
@@ -225,10 +292,20 @@ pub fn start_scaffold_instance(
 
         let (log_tx, _) = tokio::sync::broadcast::channel(100);
 
-        if let Err(e) =
-            rt.block_on(start(config, cwd, config_path, log_tx, token_clone))
-        {
+        if let Err(e) = rt.block_on(start_with_handle(
+            config,
+            cwd,
+            config_path,
+            log_tx,
+            token_clone,
+            handle_for_thread.clone(),
+        )) {
             eprintln!("Clash instance error: {}", e);
+        }
+
+        // The instance is gone: stop handing out its components.
+        if let Some(h) = handle_for_thread.as_ref() {
+            h.clear();
         }
     });
 
@@ -274,6 +351,20 @@ pub async fn start(
     log_tx: broadcast::Sender<LogEvent>,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
+    start_with_handle(config, cwd, config_path, log_tx, shutdown_token, None)
+        .await
+}
+
+/// Same as [`start`], but publishes the instance's runtime components to
+/// `runtime_handle` once they exist — see [`RuntimeHandle`].
+pub async fn start_with_handle(
+    config: InternalConfig,
+    cwd: String,
+    config_path: Option<String>,
+    log_tx: broadcast::Sender<LogEvent>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    runtime_handle: Option<RuntimeHandle>,
+) -> Result<()> {
     setup_default_crypto_provider();
 
     let cwd = PathBuf::from(cwd);
@@ -297,6 +388,11 @@ pub async fn start(
     }));
 
     let shared_components = Arc::new(RwLock::new(Arc::new(components)));
+
+    // Hand the components to the embedder, if it asked for them.
+    if let Some(h) = runtime_handle.as_ref() {
+        h.set(shared_components.clone());
+    }
 
     let mut api_runner = Arc::new(app::api::ApiRunner::new(
         controller_cfg.clone(),

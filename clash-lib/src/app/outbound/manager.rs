@@ -180,6 +180,29 @@ impl OutboundManager {
         self.selector_control.get(name).cloned()
     }
 
+    /// Select `server` inside the selector group `group`.
+    ///
+    /// `ThreadSafeSelectorControl` lives in a private module, so out-of-crate
+    /// embedders cannot call `select` directly even though
+    /// [`Self::get_selector_control`] hands them the value. This is the same
+    /// operation the `PUT /proxies/{name}` API handler performs, exposed for
+    /// embedders that drive the instance through `RuntimeHandle` instead of the
+    /// HTTP controller. Persisting the choice is the caller's decision
+    /// (`ThreadSafeCacheFile::set_selected`).
+    pub async fn select_in_group(
+        &self,
+        group: &str,
+        server: &str,
+    ) -> Result<()> {
+        let ctrl = self
+            .selector_control
+            .get(group)
+            .ok_or_else(|| anyhow::anyhow!("proxy {group} is not a Select"))?;
+        ctrl.select(server)
+            .await
+            .map_err(|e| anyhow::anyhow!("select {server} for {group} failed: {e}"))
+    }
+
     /// Get all proxies in the manager, excluding those in providers.
     pub async fn get_proxies(&self) -> HashMap<String, Box<dyn Serialize + Send>> {
         let mut r = HashMap::new();

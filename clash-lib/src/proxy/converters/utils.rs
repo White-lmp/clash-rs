@@ -13,13 +13,28 @@ impl TryFrom<(&WsOpt, &CommonConfigOptions)> for WsClient {
     fn try_from(pair: (&WsOpt, &CommonConfigOptions)) -> Result<Self, Self::Error> {
         let (x, common) = pair;
         let path = x.path.as_ref().map(|x| x.to_owned()).unwrap_or_default();
-        let headers = x.headers.as_ref().map(|x| x.to_owned()).unwrap_or_default();
+        let mut headers = x.headers.as_ref().map(|x| x.to_owned()).unwrap_or_default();
         let max_early_data = x.max_early_data.unwrap_or_default() as usize;
         let early_data_header_name = x
             .early_data_header_name
             .as_ref()
             .map(|x| x.to_owned())
             .unwrap_or_default();
+
+        // Clash.Meta derives the WebSocket `Host` header from the server when
+        // `ws-opts.headers` doesn't supply one. We must do the same: the request
+        // built in `transport::ws` is a hand-made `http::Request` carrying only
+        // the URI, and tungstenite refuses to upgrade a request without an
+        // explicit `Host` header ("Missing, duplicated or incorrect header
+        // host"). Without this, every `network: ws` config that omits `headers`
+        // — which is most panel-generated configs — fails to connect.
+        //
+        // This mirrors the defaulting already done for the v2ray-plugin path in
+        // `transport::v2ray::websocket`, but that path is only used for
+        // `plugin: v2ray-plugin`, not for plain `network: ws`.
+        if !headers.keys().any(|k| k.eq_ignore_ascii_case("host")) {
+            headers.insert("Host".to_owned(), common.server.to_owned());
+        }
 
         let client = transport::WsClient::new(
             common.server.to_owned(),
